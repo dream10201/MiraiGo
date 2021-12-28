@@ -3,22 +3,23 @@ package client
 import (
 	"crypto/md5"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
+	"go.uber.org/atomic"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/binary/jce"
+	"github.com/Mrs4s/MiraiGo/client/internal/auth"
+	"github.com/Mrs4s/MiraiGo/client/internal/highway"
+	"github.com/Mrs4s/MiraiGo/client/internal/network"
+	"github.com/Mrs4s/MiraiGo/client/internal/oicq"
 	"github.com/Mrs4s/MiraiGo/client/pb/msg"
-	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Mrs4s/MiraiGo/protocol/crypto"
-	"github.com/Mrs4s/MiraiGo/protocol/packets"
 	"github.com/Mrs4s/MiraiGo/utils"
 )
 
@@ -35,21 +36,25 @@ type QQClient struct {
 	AllowSlider bool
 
 	// account info
+	Online        atomic.Bool
 	Nickname      string
 	Age           uint16
 	Gender        uint16
 	FriendList    []*FriendInfo
 	GroupList     []*GroupInfo
 	OnlineClients []*OtherClientInfo
-	Online        bool
 	QiDian        *QiDianAccountInfo
+	GuildService  *GuildService
 
 	// protocol public field
-	SequenceId              int32
-	OutGoingPacketSessionId []byte
-	RandomKey               []byte
-	TCP                     *utils.TCPListener
-	ConnectTime             time.Time
+	SequenceId  atomic.Int32
+	SessionId   []byte
+	RandomKey   []byte
+	TCP         *network.TCPListener // todo: combine other protocol state into one struct
+	ConnectTime time.Time
+
+	transport *network.Transport
+	oicq      *oicq.Codec
 
 	// internal state
 	handlers        HandlerMap
@@ -57,79 +62,36 @@ type QQClient struct {
 	servers         []*net.TCPAddr
 	currServerIndex int
 	retryTimes      int
-	version         *versionInfo
-	deviceInfo      *DeviceInfo
+	version         *auth.AppVersion
+	deviceInfo      *auth.Device
 	alive           bool
 
-	// tlv cache
-	t104        []byte
-	t174        []byte
-	g           []byte
-	t402        []byte
-	t150        []byte
-	t149        []byte
-	t528        []byte
-	t530        []byte
-	randSeed    []byte // t403
-	rollbackSig []byte
-
-	// sync info
-	syncCookie       []byte
-	pubAccountCookie []byte
-	msgCtrlBuf       []byte
-	ksid             []byte
-
 	// session info
-	sigInfo        *loginSigInfo
-	bigDataSession *bigDataSessionInfo
-	dpwd           []byte
-	timeDiff       int64
-	pwdFlag        bool
+	qwebSeq        atomic.Int64
+	sig            *auth.SigInfo
+	highwaySession *highway.Session
+	// pwdFlag        bool
+	// timeDiff       int64
 
 	// address
-	srvSsoAddrs     []string
 	otherSrvAddrs   []string
 	fileStorageInfo *jce.FileStoragePushFSSvcList
 
 	// message state
-	lastMessageSeq         int32
 	msgSvcCache            *utils.Cache
 	lastC2CMsgTime         int64
 	transCache             *utils.Cache
-	lastLostMsg            string
 	groupSysMsgCache       *GroupSystemMessages
 	groupMsgBuilders       sync.Map
 	onlinePushCache        *utils.Cache
-	requestPacketRequestID int32
-	groupSeq               int32
-	friendSeq              int32
 	heartbeatEnabled       bool
-	groupDataTransSeq      int32
-	highwayApplyUpSeq      int32
+	requestPacketRequestID atomic.Int32
+	groupSeq               atomic.Int32
+	friendSeq              atomic.Int32
+	highwayApplyUpSeq      atomic.Int32
 	eventHandlers          *eventHandlers
 
 	groupListLock sync.Mutex
-}
-
-type loginSigInfo struct {
-	loginBitmap uint64
-	tgt         []byte
-	tgtKey      []byte
-
-	srmToken           []byte // study room manager | 0x16a
-	t133               []byte
-	encryptedA1        []byte
-	userStKey          []byte
-	userStWebSig       []byte
-	sKey               []byte
-	sKeyExpiredTime    int64
-	d2                 []byte
-	d2Key              []byte
-	wtSessionTicketKey []byte
-	deviceToken        []byte
-
-	psKeyMap    map[string][]byte
-	pt4TokenMap map[string][]byte
 }
 
 type QiDianAccountInfo struct {
@@ -144,10 +106,17 @@ type QiDianAccountInfo struct {
 type handlerInfo struct {
 	fun     func(i interface{}, err error)
 	dynamic bool
-	params  requestParams
+	params  network.RequestParams
 }
 
-var decoders = map[string]func(*QQClient, *incomingPacketInfo, []byte) (interface{}, error){
+func (h *handlerInfo) getParams() network.RequestParams {
+	if h == nil {
+		return nil
+	}
+	return h.params
+}
+
+var decoders = map[string]func(*QQClient, *network.IncomingPacketInfo, []byte) (interface{}, error){
 	"wtlogin.login":                                decodeLoginResponse,
 	"wtlogin.exchange_emp":                         decodeExchangeEmpResponse,
 	"wtlogin.trans_emp":                            decodeTransEmpResponse,
@@ -156,6 +125,7 @@ var decoders = map[string]func(*QQClient, *incomingPacketInfo, []byte) (interfac
 	"MessageSvc.PushNotify":                        decodeSvcNotify,
 	"OnlinePush.ReqPush":                           decodeOnlinePushReqPacket,
 	"OnlinePush.PbPushTransMsg":                    decodeOnlinePushTransPacket,
+	"OnlinePush.SidTicketExpired":                  decodeSidExpiredPacket,
 	"ConfigPushSvc.PushReq":                        decodePushReqPacket,
 	"MessageSvc.PbGetMsg":                          decodeMessageSvcPacket,
 	"MessageSvc.PushForceOffline":                  decodeForceOfflinePacket,
@@ -165,14 +135,12 @@ var decoders = map[string]func(*QQClient, *incomingPacketInfo, []byte) (interfac
 	"friendlist.GetTroopListReqV2":                 decodeGroupListResponse,
 	"friendlist.GetTroopMemberListReq":             decodeGroupMemberListResponse,
 	"group_member_card.get_group_member_card_info": decodeGroupMemberInfoResponse,
-	"PttStore.GroupPttUp":                          decodeGroupPttStoreResponse,
 	"LongConn.OffPicUp":                            decodeOffPicUpResponse,
 	"ProfileService.Pb.ReqSystemMsgNew.Group":      decodeSystemMsgGroupPacket,
 	"ProfileService.Pb.ReqSystemMsgNew.Friend":     decodeSystemMsgFriendPacket,
 	"OidbSvc.0xd79":                                decodeWordSegmentation,
 	"OidbSvc.0x990":                                decodeTranslateResponse,
 	"SummaryCard.ReqSummaryCard":                   decodeSummaryCardResponse,
-	"LightAppSvc.mini_app_info.GetAppInfoById":     decodeAppInfoResponse,
 }
 
 func init() {
@@ -185,31 +153,45 @@ func NewClient(uin int64, password string) *QQClient {
 }
 
 func NewClientEmpty() *QQClient {
-	return NewClient(0, "")
+	return NewClientMd5(0, [16]byte{})
 }
 
 func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
-	crypto.ECDH.FetchPubKey(uin)
 	cli := &QQClient{
-		Uin:                     uin,
-		PasswordMd5:             passwordMd5,
-		SequenceId:              0x3635,
-		AllowSlider:             true,
-		RandomKey:               make([]byte, 16),
-		OutGoingPacketSessionId: []byte{0x02, 0xB0, 0x5B, 0x8B},
-		TCP:                     &utils.TCPListener{},
-		sigInfo:                 &loginSigInfo{},
-		requestPacketRequestID:  1921334513,
-		groupSeq:                int32(rand.Intn(20000)),
-		friendSeq:               22911,
-		highwayApplyUpSeq:       77918,
-		eventHandlers:           &eventHandlers{},
-		msgSvcCache:             utils.NewCache(time.Second * 15),
-		transCache:              utils.NewCache(time.Second * 15),
-		onlinePushCache:         utils.NewCache(time.Second * 15),
-		servers:                 []*net.TCPAddr{},
-		alive:                   true,
+		Uin:         uin,
+		PasswordMd5: passwordMd5,
+		AllowSlider: true,
+		TCP:         &network.TCPListener{},
+		sig: &auth.SigInfo{
+			OutPacketSessionID: []byte{0x02, 0xB0, 0x5B, 0x8B},
+		},
+		eventHandlers:   &eventHandlers{},
+		msgSvcCache:     utils.NewCache(time.Second * 15),
+		transCache:      utils.NewCache(time.Second * 15),
+		onlinePushCache: utils.NewCache(time.Second * 15),
+		servers:         []*net.TCPAddr{},
+		alive:           true,
+		highwaySession:  new(highway.Session),
+
+		version:    new(auth.AppVersion),
+		deviceInfo: new(auth.Device),
 	}
+
+	cli.transport = &network.Transport{
+		Sig:     cli.sig,
+		Version: cli.version,
+		Device:  cli.deviceInfo,
+	}
+	cli.oicq = oicq.NewCodec(cli.Uin)
+	{ // init atomic values
+		cli.SequenceId.Store(0x3635)
+		cli.requestPacketRequestID.Store(1921334513)
+		cli.groupSeq.Store(int32(rand.Intn(20000)))
+		cli.friendSeq.Store(22911)
+		cli.highwayApplyUpSeq.Store(77918)
+	}
+	cli.highwaySession.Uin = strconv.FormatInt(cli.Uin, 10)
+	cli.GuildService = &GuildService{c: cli}
 	cli.UseDevice(SystemDeviceInfo)
 	sso, err := getSSOAddress()
 	if err == nil && len(sso) > 0 {
@@ -242,7 +224,7 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 	for i := range cli.servers {
 		go func(index int) {
 			defer wg.Done()
-			p, err := qualityTest(cli.servers[index])
+			p, err := qualityTest(cli.servers[index].String())
 			if err != nil {
 				pings[index] = 9999
 				return
@@ -263,14 +245,15 @@ func NewClientMd5(uin int64, passwordMd5 [16]byte) *QQClient {
 	return cli
 }
 
-func (c *QQClient) UseDevice(info *DeviceInfo) {
-	c.version = genVersionInfo(info.Protocol)
-	c.ksid = []byte(fmt.Sprintf("|%s|A8.2.7.27f6ea96", info.IMEI))
-	c.deviceInfo = info
+func (c *QQClient) UseDevice(info *auth.Device) {
+	*c.version = *info.Protocol.Version()
+	*c.deviceInfo = *info
+	c.highwaySession.AppID = int32(c.version.AppId)
+	c.sig.Ksid = []byte(fmt.Sprintf("|%s|A8.2.7.27f6ea96", info.IMEI))
 }
 
 func (c *QQClient) Release() {
-	if c.Online {
+	if c.Online.Load() {
 		c.Disconnect()
 	}
 	c.alive = false
@@ -278,7 +261,7 @@ func (c *QQClient) Release() {
 
 // Login send login request
 func (c *QQClient) Login() (*LoginResponse, error) {
-	if c.Online {
+	if c.Online.Load() {
 		return nil, ErrAlreadyOnline
 	}
 	err := c.connect()
@@ -292,13 +275,13 @@ func (c *QQClient) Login() (*LoginResponse, error) {
 	}
 	l := rsp.(LoginResponse)
 	if l.Success {
-		_ = c.init(false)
+		err = c.init(false)
 	}
-	return &l, nil
+	return &l, err
 }
 
 func (c *QQClient) TokenLogin(token []byte) error {
-	if c.Online {
+	if c.Online.Load() {
 		return ErrAlreadyOnline
 	}
 	err := c.connect()
@@ -308,18 +291,18 @@ func (c *QQClient) TokenLogin(token []byte) error {
 	{
 		r := binary.NewReader(token)
 		c.Uin = r.ReadInt64()
-		c.sigInfo.d2 = r.ReadBytesShort()
-		c.sigInfo.d2Key = r.ReadBytesShort()
-		c.sigInfo.tgt = r.ReadBytesShort()
-		c.sigInfo.srmToken = r.ReadBytesShort()
-		c.sigInfo.t133 = r.ReadBytesShort()
-		c.sigInfo.encryptedA1 = r.ReadBytesShort()
-		c.sigInfo.wtSessionTicketKey = r.ReadBytesShort()
-		c.OutGoingPacketSessionId = r.ReadBytesShort()
+		c.sig.D2 = r.ReadBytesShort()
+		c.sig.D2Key = r.ReadBytesShort()
+		c.sig.TGT = r.ReadBytesShort()
+		c.sig.SrmToken = r.ReadBytesShort()
+		c.sig.T133 = r.ReadBytesShort()
+		c.sig.EncryptedA1 = r.ReadBytesShort()
+		c.oicq.WtSessionTicketKey = r.ReadBytesShort()
+		c.sig.OutPacketSessionID = r.ReadBytesShort()
 		// SystemDeviceInfo.TgtgtKey = r.ReadBytesShort()
 		c.deviceInfo.TgtgtKey = r.ReadBytesShort()
 	}
-	_, err = c.sendAndWait(c.buildRequestChangeSigPacket())
+	_, err = c.sendAndWait(c.buildRequestChangeSigPacket(c.version.MainSigMap))
 	if err != nil {
 		return err
 	}
@@ -327,14 +310,18 @@ func (c *QQClient) TokenLogin(token []byte) error {
 }
 
 func (c *QQClient) FetchQRCode() (*QRCodeLoginResponse, error) {
-	if c.Online {
+	return c.FetchQRCodeCustomSize(3, 4, 2)
+}
+
+func (c *QQClient) FetchQRCodeCustomSize(size, margin, ecLevel uint32) (*QRCodeLoginResponse, error) {
+	if c.Online.Load() {
 		return nil, ErrAlreadyOnline
 	}
 	err := c.connect()
 	if err != nil {
 		return nil, err
 	}
-	i, err := c.sendAndWait(c.buildQRCodeFetchRequestPacket())
+	i, err := c.sendAndWait(c.buildQRCodeFetchRequestPacket(size, margin, ecLevel))
 	if err != nil {
 		return nil, errors.Wrap(err, "fetch qrcode error")
 	}
@@ -356,9 +343,9 @@ func (c *QQClient) QRCodeLogin(info *QRCodeLoginInfo) (*LoginResponse, error) {
 	}
 	rsp := i.(LoginResponse)
 	if rsp.Success {
-		_ = c.init(false)
+		err = c.init(false)
 	}
-	return &rsp, nil
+	return &rsp, err
 }
 
 // SubmitCaptcha send captcha to server
@@ -371,9 +358,9 @@ func (c *QQClient) SubmitCaptcha(result string, sign []byte) (*LoginResponse, er
 	}
 	l := rsp.(LoginResponse)
 	if l.Success {
-		_ = c.init(false)
+		err = c.init(false)
 	}
-	return &l, nil
+	return &l, err
 }
 
 func (c *QQClient) SubmitTicket(ticket string) (*LoginResponse, error) {
@@ -385,9 +372,9 @@ func (c *QQClient) SubmitTicket(ticket string) (*LoginResponse, error) {
 	}
 	l := rsp.(LoginResponse)
 	if l.Success {
-		_ = c.init(false)
+		err = c.init(false)
 	}
-	return &l, nil
+	return &l, err
 }
 
 func (c *QQClient) SubmitSMS(code string) (*LoginResponse, error) {
@@ -398,9 +385,9 @@ func (c *QQClient) SubmitSMS(code string) (*LoginResponse, error) {
 	}
 	l := rsp.(LoginResponse)
 	if l.Success {
-		_ = c.init(false)
+		err = c.init(false)
 	}
-	return &l, nil
+	return &l, err
 }
 
 func (c *QQClient) RequestSMS() bool {
@@ -413,9 +400,10 @@ func (c *QQClient) RequestSMS() bool {
 }
 
 func (c *QQClient) init(tokenLogin bool) error {
-	if len(c.g) == 0 {
+	if len(c.sig.G) == 0 {
 		c.Warning("device lock is disable. http api may fail.")
 	}
+	c.highwaySession.Uin = strconv.FormatInt(c.Uin, 10)
 	if err := c.registerClient(); err != nil {
 		return errors.Wrap(err, "register error")
 	}
@@ -442,26 +430,27 @@ func (c *QQClient) init(tokenLogin bool) error {
 		go c.doHeartbeat()
 	}
 	_ = c.RefreshStatus()
-	if c.version.Protocol == QiDian {
+	if c.version.Protocol == auth.QiDian {
 		_, _ = c.sendAndWait(c.buildLoginExtraPacket())     // 小登录
 		_, _ = c.sendAndWait(c.buildConnKeyRequestPacket()) // big data key 如果等待 config push 的话时间来不及
 	}
 	seq, pkt := c.buildGetMessageRequestPacket(msg.SyncFlag_START, time.Now().Unix())
-	_, _ = c.sendAndWait(seq, pkt, requestParams{"used_reg_proxy": true, "init": true})
+	_, _ = c.sendAndWait(seq, pkt, network.RequestParams{"used_reg_proxy": true, "init": true})
+	c.syncChannelFirstView()
 	return nil
 }
 
 func (c *QQClient) GenToken() []byte {
 	return binary.NewWriterF(func(w *binary.Writer) {
 		w.WriteUInt64(uint64(c.Uin))
-		w.WriteBytesShort(c.sigInfo.d2)
-		w.WriteBytesShort(c.sigInfo.d2Key)
-		w.WriteBytesShort(c.sigInfo.tgt)
-		w.WriteBytesShort(c.sigInfo.srmToken)
-		w.WriteBytesShort(c.sigInfo.t133)
-		w.WriteBytesShort(c.sigInfo.encryptedA1)
-		w.WriteBytesShort(c.sigInfo.wtSessionTicketKey)
-		w.WriteBytesShort(c.OutGoingPacketSessionId)
+		w.WriteBytesShort(c.sig.D2)
+		w.WriteBytesShort(c.sig.D2Key)
+		w.WriteBytesShort(c.sig.TGT)
+		w.WriteBytesShort(c.sig.SrmToken)
+		w.WriteBytesShort(c.sig.T133)
+		w.WriteBytesShort(c.sig.EncryptedA1)
+		w.WriteBytesShort(c.oicq.WtSessionTicketKey)
+		w.WriteBytesShort(c.sig.OutPacketSessionID)
 		w.WriteBytesShort(c.deviceInfo.TgtgtKey)
 	})
 }
@@ -511,7 +500,7 @@ func (c *QQClient) ReloadFriendList() error {
 // 当使用普通QQ时: 请求好友列表
 // 当使用企点QQ时: 请求外部联系人列表
 func (c *QQClient) GetFriendList() (*FriendListResponse, error) {
-	if c.version.Protocol == QiDian {
+	if c.version.Protocol == auth.QiDian {
 		rsp, err := c.getQiDianAddressDetailList()
 		if err != nil {
 			return nil, err
@@ -534,71 +523,6 @@ func (c *QQClient) GetFriendList() (*FriendListResponse, error) {
 		}
 	}
 	return r, nil
-}
-
-func (c *QQClient) GetForwardMessage(resID string) *message.ForwardMessage {
-	m := c.DownloadForwardMessage(resID)
-	if m == nil {
-		return nil
-	}
-	var (
-		item *msg.PbMultiMsgItem
-		ret  = &message.ForwardMessage{Nodes: []*message.ForwardNode{}}
-	)
-	for _, iter := range m.Items {
-		if iter.GetFileName() == m.FileName {
-			item = iter
-		}
-	}
-	if item == nil {
-		return nil
-	}
-	for _, m := range item.GetBuffer().GetMsg() {
-		ret.Nodes = append(ret.Nodes, &message.ForwardNode{
-			SenderId: m.Head.GetFromUin(),
-			SenderName: func() string {
-				if m.Head.GetMsgType() == 82 && m.Head.GroupInfo != nil {
-					return m.Head.GroupInfo.GetGroupCard()
-				}
-				return m.Head.GetFromNick()
-			}(),
-			Time:    m.Head.GetMsgTime(),
-			Message: message.ParseMessageElems(m.Body.RichText.Elems),
-		})
-	}
-	return ret
-}
-
-func (c *QQClient) DownloadForwardMessage(resId string) *message.ForwardElement {
-	i, err := c.sendAndWait(c.buildMultiApplyDownPacket(resId))
-	if err != nil {
-		return nil
-	}
-	multiMsg := i.(*msg.PbMultiMsgTransmit)
-	if multiMsg.GetPbItemList() == nil {
-		return nil
-	}
-	var pv string
-	for i := 0; i < int(math.Min(4, float64(len(multiMsg.GetMsg())))); i++ {
-		m := multiMsg.Msg[i]
-		pv += fmt.Sprintf(`<title size="26" color="#777777">%s: %s</title>`,
-			func() string {
-				if m.Head.GetMsgType() == 82 && m.Head.GroupInfo != nil {
-					return m.Head.GroupInfo.GetGroupCard()
-				}
-				return m.Head.GetFromNick()
-			}(),
-			message.ToReadableString(
-				message.ParseMessageElems(multiMsg.Msg[i].GetBody().GetRichText().Elems),
-			),
-		)
-	}
-	return genForwardTemplate(
-		resId, pv, "群聊的聊天记录", "[聊天记录]", "聊天记录",
-		fmt.Sprintf("查看 %d 条转发消息", len(multiMsg.GetMsg())),
-		time.Now().UnixNano(),
-		multiMsg.GetPbItemList(),
-	)
 }
 
 func (c *QQClient) SendGroupPoke(groupCode, target int64) {
@@ -751,11 +675,11 @@ func (c *QQClient) SolveFriendRequest(req *NewFriendRequest, accept bool) {
 }
 
 func (c *QQClient) getSKey() string {
-	if c.sigInfo.sKeyExpiredTime < time.Now().Unix() && len(c.g) > 0 {
+	if c.sig.SKeyExpiredTime < time.Now().Unix() && len(c.sig.G) > 0 {
 		c.Debug("skey expired. refresh...")
 		_, _ = c.sendAndWait(c.buildRequestTgtgtNopicsigPacket())
 	}
-	return string(c.sigInfo.sKey)
+	return string(c.sig.SKey)
 }
 
 func (c *QQClient) getCookies() string {
@@ -765,7 +689,7 @@ func (c *QQClient) getCookies() string {
 func (c *QQClient) getCookiesWithDomain(domain string) string {
 	cookie := c.getCookies()
 
-	if psKey, ok := c.sigInfo.psKeyMap[domain]; ok {
+	if psKey, ok := c.sig.PsKeyMap[domain]; ok {
 		return fmt.Sprintf("%s p_uin=o%d; p_skey=%s;", cookie, c.Uin, psKey)
 	} else {
 		return cookie
@@ -832,53 +756,55 @@ func (c *QQClient) SetCustomServer(servers []*net.TCPAddr) {
 	c.servers = append(servers, c.servers...)
 }
 
-func (c *QQClient) SendGroupGift(groupCode, uin uint64, gift message.GroupGift) {
-	_, packet := c.sendGroupGiftPacket(groupCode, uin, gift)
-	_ = c.sendPacket(packet)
-}
-
 func (c *QQClient) registerClient() error {
 	_, err := c.sendAndWait(c.buildClientRegisterPacket())
 	if err == nil {
-		c.Online = true
+		c.Online.Store(true)
 	}
 	return err
 }
 
 func (c *QQClient) nextSeq() uint16 {
-	return uint16(atomic.AddInt32(&c.SequenceId, 1) & 0x7FFF)
+	return uint16(c.SequenceId.Add(1) & 0x7FFF)
 }
 
 func (c *QQClient) nextPacketSeq() int32 {
-	return atomic.AddInt32(&c.requestPacketRequestID, 2)
+	return c.requestPacketRequestID.Add(2)
 }
 
 func (c *QQClient) nextGroupSeq() int32 {
-	return atomic.AddInt32(&c.groupSeq, 2)
+	return c.groupSeq.Add(2)
 }
 
 func (c *QQClient) nextFriendSeq() int32 {
-	return atomic.AddInt32(&c.friendSeq, 1)
+	return c.friendSeq.Add(1)
 }
 
-func (c *QQClient) nextGroupDataTransSeq() int32 {
-	return atomic.AddInt32(&c.groupDataTransSeq, 2)
+func (c *QQClient) nextQWebSeq() int64 {
+	return c.qwebSeq.Add(1)
 }
 
 func (c *QQClient) nextHighwayApplySeq() int32 {
-	return atomic.AddInt32(&c.highwayApplyUpSeq, 2)
+	return c.highwayApplyUpSeq.Add(2)
 }
 
 func (c *QQClient) doHeartbeat() {
 	c.heartbeatEnabled = true
 	times := 0
-	for c.Online {
+	for c.Online.Load() {
 		time.Sleep(time.Second * 30)
 		seq := c.nextSeq()
-		sso := packets.BuildSsoPacket(seq, c.version.AppId, c.version.SubAppId, "Heartbeat.Alive", c.deviceInfo.IMEI, []byte{}, c.OutGoingPacketSessionId, []byte{}, c.ksid)
-		packet := packets.BuildLoginPacket(c.Uin, 0, []byte{}, sso, []byte{})
+		req := network.Request{
+			Type:        network.RequestTypeLogin,
+			EncryptType: network.EncryptTypeNoEncrypt,
+			SequenceID:  int32(seq),
+			Uin:         c.Uin,
+			CommandName: "Heartbeat.Alive",
+			Body:        EmptyBytes,
+		}
+		packet := c.transport.PackPacket(&req)
 		_, err := c.sendAndWait(seq, packet)
-		if errors.Is(err, utils.ErrConnectionClosed) {
+		if errors.Is(err, network.ErrConnectionClosed) {
 			continue
 		}
 		times++

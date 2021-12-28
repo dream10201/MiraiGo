@@ -5,15 +5,15 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Mrs4s/MiraiGo/client/pb/msgtype0x210"
-
 	"github.com/pkg/errors"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/binary/jce"
+	"github.com/Mrs4s/MiraiGo/client/internal/network"
 	"github.com/Mrs4s/MiraiGo/client/pb"
+	"github.com/Mrs4s/MiraiGo/client/pb/msgtype0x210"
 	"github.com/Mrs4s/MiraiGo/client/pb/notify"
+	"github.com/Mrs4s/MiraiGo/internal/proto"
 )
 
 var msg0x210Decoders = map[int64]func(*QQClient, []byte) error{
@@ -23,15 +23,14 @@ var msg0x210Decoders = map[int64]func(*QQClient, []byte) error{
 }
 
 // OnlinePush.ReqPush
-func decodeOnlinePushReqPacket(c *QQClient, info *incomingPacketInfo, payload []byte) (interface{}, error) {
+func decodeOnlinePushReqPacket(c *QQClient, info *network.IncomingPacketInfo, payload []byte) (interface{}, error) {
 	request := &jce.RequestPacket{}
 	request.ReadFrom(jce.NewJceReader(payload))
 	data := &jce.RequestDataVersion2{}
 	data.ReadFrom(jce.NewJceReader(request.SBuffer))
 	jr := jce.NewJceReader(data.Map["req"]["OnlinePushPack.SvcReqPushMsg"][1:])
-	msgInfos := []jce.PushMessageInfo{}
 	uin := jr.ReadInt64(0)
-	jr.ReadSlice(&msgInfos, 2)
+	msgInfos := jr.ReadPushMessageInfos(2)
 	_ = c.sendPacket(c.buildDeleteOnlinePushPacket(uin, 0, nil, info.SequenceId, msgInfos))
 	for _, m := range msgInfos {
 		k := fmt.Sprintf("%v%v%v", m.MsgSeq, m.MsgTime, m.MsgUid)
@@ -113,8 +112,8 @@ func decodeOnlinePushReqPacket(c *QQClient, info *incomingPacketInfo, payload []
 		if m.MsgType == 528 {
 			vr := jce.NewJceReader(m.VMsg)
 			subType := vr.ReadInt64(0)
-			protobuf := vr.ReadBytes(10)
 			if decoder, ok := msg0x210Decoders[subType]; ok {
+				protobuf := vr.ReadBytes(10)
 				if err := decoder(c, protobuf); err != nil {
 					return nil, errors.Wrap(err, "decode online push 0x210 error")
 				}
@@ -239,7 +238,7 @@ func msgType0x210Sub44Decoder(c *QQClient, protobuf []byte) error {
 	}
 	groupJoinLock.Lock()
 	defer groupJoinLock.Unlock()
-	if s44.GroupSyncMsg.GetGrpCode() != 0 { // member sync
+	if s44.GroupSyncMsg.GetGrpCode() == 0 { // member sync
 		return errors.New("invalid group code")
 	}
 	c.Debug("syncing members.")

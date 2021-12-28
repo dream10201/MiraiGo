@@ -2,9 +2,10 @@ package binary
 
 import (
 	"bytes"
-	"compress/gzip"
-	"compress/zlib"
 	"sync"
+
+	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zlib"
 )
 
 var bufferPool = sync.Pool{
@@ -13,20 +14,19 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// NewWriter 从池中取出一个 Writer
-func NewWriter() *Writer {
-	w := bufferPool.Get().(*Writer)
-	if w == nil {
-		return new(Writer)
-	}
-	return w
+// SelectWriter 从池中取出一个 Writer
+func SelectWriter() *Writer {
+	// 因为 bufferPool 定义有 New 函数
+	// 所以 bufferPool.Get() 永不为 nil
+	// 不用判空
+	return bufferPool.Get().(*Writer)
 }
 
 // PutWriter 将 Writer 放回池中
 func PutWriter(w *Writer) {
 	// See https://golang.org/issue/23199
 	const maxSize = 1 << 16
-	if w.Cap() < maxSize { // 对于大Buffer直接丢弃
+	if (*bytes.Buffer)(w).Cap() < maxSize { // 对于大Buffer直接丢弃
 		w.Reset()
 		bufferPool.Put(w)
 	}
@@ -89,39 +89,4 @@ func releaseZlibWriter(w *zlibWriter) {
 		w.buf.Reset()
 		zlibPool.Put(w)
 	}
-}
-
-const size256k = 256 * 1024
-
-var b256kPool = sync.Pool{
-	New: func() interface{} {
-		return make128kSlicePointer()
-	},
-}
-
-// Get256KBytes 获取一个128k大小 []byte
-func Get256KBytes() *[]byte {
-	buf := b256kPool.Get().(*[]byte)
-	if buf == nil {
-		return make128kSlicePointer()
-	}
-	if cap(*buf) < size256k {
-		return make128kSlicePointer()
-	}
-	*buf = (*buf)[:size256k]
-	return buf
-}
-
-// Put256KBytes 放回一个128k大小 []byte
-func Put256KBytes(b *[]byte) {
-	if cap(*b) < size256k || cap(*b) > 2*size256k { // 太大或太小的 []byte 不要放入
-		return
-	}
-	*b = (*b)[:cap(*b)]
-	b256kPool.Put(b)
-}
-
-func make128kSlicePointer() *[]byte {
-	data := make([]byte, size256k)
-	return &data
 }

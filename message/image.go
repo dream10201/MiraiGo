@@ -3,10 +3,9 @@ package message
 import (
 	"strings"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client/pb/msg"
+	"github.com/Mrs4s/MiraiGo/internal/proto"
 )
 
 /* -------- Definitions -------- */
@@ -34,6 +33,18 @@ type FriendImageElement struct {
 	Url     string
 
 	Flash bool
+}
+
+type GuildImageElement struct {
+	FileId        int64
+	FilePath      string
+	ImageType     int32
+	Size          int32
+	Width         int32
+	Height        int32
+	DownloadIndex string
+	Md5           []byte
+	Url           string
 }
 
 type ImageBizType uint32
@@ -71,6 +82,10 @@ func (e *GroupImageElement) Type() ElementType {
 }
 
 func (e *FriendImageElement) Type() ElementType {
+	return Image
+}
+
+func (e *GuildImageElement) Type() ElementType {
 	return Image
 }
 
@@ -123,8 +138,7 @@ func (e *GroupImageElement) Pack() (r []*msg.Elem) {
 	return []*msg.Elem{elem}
 }
 
-func (e *FriendImageElement) Pack() (r []*msg.Elem) {
-	r = []*msg.Elem{}
+func (e *FriendImageElement) Pack() []*msg.Elem {
 	image := &msg.NotOnlineImage{
 		FilePath:     &e.ImageId,
 		ResId:        &e.ImageId,
@@ -153,5 +167,26 @@ func (e *FriendImageElement) Pack() (r []*msg.Elem) {
 	}
 
 	elem := &msg.Elem{NotOnlineImage: image}
+	return []*msg.Elem{elem}
+}
+
+func (e *GuildImageElement) Pack() (r []*msg.Elem) {
+	cface := &msg.CustomFace{
+		FileType:  proto.Int32(66),
+		Useful:    proto.Int32(1),
+		BizType:   proto.Int32(0),
+		Width:     &e.Width,
+		Height:    &e.Height,
+		FileId:    proto.Int32(int32(e.FileId)),
+		FilePath:  &e.FilePath,
+		ImageType: &e.ImageType,
+		Size:      &e.Size,
+		Md5:       e.Md5,
+		PbReserve: binary.DynamicProtoMessage{
+			1: uint32(0), 2: uint32(0), 6: "", 10: uint32(0), 15: uint32(8),
+			20: e.DownloadIndex,
+		}.Encode(),
+	}
+	elem := &msg.Elem{CustomFace: cface}
 	return []*msg.Elem{elem}
 }
